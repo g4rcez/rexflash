@@ -63,6 +63,14 @@ dofile("/opt/homebrew/opt/rexflash/share/rexflash/rexflash.lua") {
 Rex defines two actions, `rexflash_hint` and `rexflash_flash`. They show in the action list even
 without keys. `hint_key` and `flash_key` bind them. Press the same key again, or Esc, to close the overlay.
 
+### With an AI agent
+
+If your agent uses the Rex skill (`rex skill setup`), ask it to install rexflash from
+[AI_INSTRUCTIONS.md](AI_INSTRUCTIONS.md). The file has the install, the `init.lua` change, the checks
+(`rex config check`, `rex config reload`, `rex keymap`) and the fixes for common errors:
+
+> Install and configure rexflash. Follow https://raw.githubusercontent.com/g4rcez/rexflash/main/AI_INSTRUCTIONS.md
+
 ## Use
 
 **Hint mode**
