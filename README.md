@@ -123,6 +123,9 @@ By default hint mode looks for all of these except `digit`:
 | `semver`     | `v1.2.3`, `1.13.1`                               |
 | `diff`       | Paths in `diff --git` and `---`/`+++` lines      |
 | `git-status` | Paths in `git status` output                     |
+| `jwt`        | JSON Web Tokens, with any `=` padding            |
+| `base64`     | Base64 strings, with the `=` padding             |
+| `base32`     | Base32 strings, with the `=` padding             |
 | `digit`      | Numbers of 4 or more digits (off by default)     |
 
 When matches overlap, the more specific pattern wins: a URL beats the path inside it, and `file-line` beats `path`. A match that wraps

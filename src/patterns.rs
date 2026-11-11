@@ -28,7 +28,7 @@ pub struct Found {
 
 pub const DEFAULT: &[&str] = &[
     "url", "file-line", "path", "sha", "ip", "ipv6", "uuid", "email", "hex", "color", "semver",
-    "diff", "git-status",
+    "diff", "git-status", "jwt", "base64", "base32",
 ];
 
 /// What may come before a path-like match.
@@ -49,6 +49,23 @@ fn is_ipv4(s: &str) -> bool {
 
 fn is_ipv6(s: &str) -> bool {
     has_digit(s) && (s.contains("::") || s.matches(':').count() == 7)
+}
+
+/// Base64 with `=` padding, or long enough and mixed enough that it is not a word or an identifier.
+fn is_base64(s: &str) -> bool {
+    let body = s.trim_end_matches('=');
+    let upper = body.bytes().any(|b| b.is_ascii_uppercase());
+    let lower = body.bytes().any(|b| b.is_ascii_lowercase());
+    if body.len() < s.len() {
+        return s.len().is_multiple_of(4) && (has_digit(body) || (upper && lower));
+    }
+    // A leading `/` is an absolute path.
+    s.len() >= 24 && upper && lower && has_digit(s) && !s.starts_with('/')
+}
+
+/// Base32 (RFC 4648) with `=` padding, or long and with a digit, so that `CONSTANT_NAME` does not match.
+fn is_base32(s: &str) -> bool {
+    s.len().is_multiple_of(8) && (s.ends_with('=') || (s.len() >= 16 && has_digit(s)))
 }
 
 fn builtin(name: &str) -> Option<Pattern> {
@@ -101,6 +118,15 @@ fn builtin(name: &str) -> Option<Pattern> {
             None,
         ),
         "digit" => (1, plain(r"\b\d{4,}\b"), false, None),
+        // Each part may carry `=` padding. The header starts with `eyJ`, which is `{"` in base64.
+        "jwt" => (
+            4,
+            plain(r"\beyJ[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]*={0,2}"),
+            false,
+            None,
+        ),
+        "base64" => (2, bounded(r"[A-Za-z0-9+/]{8,}(?:={1,2}|\b)"), false, Some(is_base64)),
+        "base32" => (2, bounded(r"[A-Z2-7]{8,}(?:={1,6}|\b)"), false, Some(is_base32)),
         "diff" => (
             3,
             r"^(?:(?:---|\+\+\+) [ab]/|diff --git a/)(?P<match>\S+)".to_string(),
@@ -264,6 +290,38 @@ mod tests {
             matches("\tmodified:   src/lib.rs\n+++ b/src/new.rs\n", Some(&["git-status", "diff"])),
             vec!["src/lib.rs", "src/new.rs"]
         );
+    }
+
+    #[test]
+    fn base64_keeps_the_padding_and_wins_over_path() {
+        assert_eq!(
+            matches("d5VsWZyhpBEun7usAa7QMnIN5c6WYS/EP7Caj/66OLo=\n", None),
+            vec!["d5VsWZyhpBEun7usAa7QMnIN5c6WYS/EP7Caj/66OLo="]
+        );
+        assert_eq!(matches("key=dGVzdDEyMw==\n", Some(&["base64"])), vec!["dGVzdDEyMw=="]);
+    }
+
+    #[test]
+    fn base64_ignores_words_and_paths() {
+        assert_eq!(
+            matches("InitializeConfiguration /usr/local/lib/Python3Packages/Thing\n", Some(&["base64"])),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn base32_keeps_the_padding() {
+        assert_eq!(matches("JBSWY3DPEE======\n", Some(&["base32"])), vec!["JBSWY3DPEE======"]);
+        assert_eq!(matches("CONSTANT_NAME\n", Some(&["base32"])), Vec::<String>::new());
+    }
+
+    #[test]
+    fn jwt_is_one_match() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(matches(&format!("Bearer {jwt}\n"), None), vec![jwt]);
+        assert_eq!(matches("eyJhbGciOiJIUzI1NiJ9==.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.sig=\n", Some(&["jwt"])), vec![
+            "eyJhbGciOiJIUzI1NiJ9==.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.sig="
+        ]);
     }
 
     #[test]
