@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 pub fn perform(
     action: &str,
     text: &str,
+    is_uri: bool,
     modifier: Modifier,
     hint: &str,
     target: &Target,
@@ -20,7 +21,7 @@ pub fn perform(
     match action {
         "" | ":copy:" => Ok(()),
         ":paste:" => target.write(text),
-        ":open:" => open(text, cwd),
+        ":open:" => open(text, cwd, is_uri),
         command => run_command(command, text, modifier, hint, cwd),
     }
 }
@@ -56,8 +57,11 @@ fn strip_line_suffix(text: &str) -> &str {
     s
 }
 
-/// Makes the text safe as one argument of `open`: no `~`, and never a leading dash that reads as an option.
-fn open_arg(text: &str, home: Option<&str>) -> String {
+/// Hyperlink URIs stay unchanged; paths expand `~` and cannot become options to `open`.
+fn open_arg(text: &str, home: Option<&str>, is_uri: bool) -> String {
+    if is_uri {
+        return text.to_string();
+    }
     let path = strip_line_suffix(text);
     if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), home) {
         return format!("{home}/{rest}");
@@ -68,9 +72,9 @@ fn open_arg(text: &str, home: Option<&str>) -> String {
     path.to_string()
 }
 
-fn open(text: &str, cwd: Option<&str>) -> Result<(), String> {
+fn open(text: &str, cwd: Option<&str>, is_uri: bool) -> Result<(), String> {
     let mut cmd = Command::new("open");
-    cmd.arg(open_arg(text, std::env::var("HOME").ok().as_deref()));
+    cmd.arg(open_arg(text, std::env::var("HOME").ok().as_deref(), is_uri));
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -119,22 +123,22 @@ mod tests {
 
     #[test]
     fn open_drops_line_and_column() {
-        assert_eq!(open_arg("src/main.rs:42:5", None), "src/main.rs");
+        assert_eq!(open_arg("src/main.rs:42:5", None, false), "src/main.rs");
     }
 
     #[test]
     fn open_keeps_the_port_of_a_url() {
-        assert_eq!(open_arg("http://localhost:8080", None), "http://localhost:8080");
+        assert_eq!(open_arg("http://localhost:8080", None, false), "http://localhost:8080");
     }
 
     #[test]
     fn open_expands_the_home_directory() {
-        assert_eq!(open_arg("~/notes.md", Some("/Users/x")), "/Users/x/notes.md");
+        assert_eq!(open_arg("~/notes.md", Some("/Users/x"), false), "/Users/x/notes.md");
     }
 
     #[test]
     fn open_never_passes_a_leading_dash() {
-        assert_eq!(open_arg("-a/Some.app", None), "./-a/Some.app");
+        assert_eq!(open_arg("-a/Some.app", None, false), "./-a/Some.app");
     }
 
     #[test]
@@ -149,5 +153,12 @@ mod tests {
     #[test]
     fn failing_command_is_an_error() {
         assert!(run_command("exit 3", "x", Modifier::Main, "a", None).is_err());
+    }
+
+    #[test]
+    fn osc8_destinations_are_opened_verbatim() {
+        for uri in ["file:/tmp/notes:42:5", "vscode://file/tmp/main.rs:42:5", "urn:example:123", "mailto:user@example.com"] {
+            assert_eq!(open_arg(uri, Some("/Users/x"), true), uri);
+        }
     }
 }

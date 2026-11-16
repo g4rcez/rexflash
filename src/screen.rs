@@ -3,8 +3,9 @@
 //! The input has one line per logical line. A line longer than the pane width is wrapped here into
 //! several rows, as the terminal does, and those rows are marked as wrapped.
 //!
-//! Only text and SGR (colour) sequences are kept. Every other escape sequence and every control
-//! character is dropped, so screen text can never carry a control character into a later action.
+//! Text and SGR (colour) sequences are kept; OSC 8 destinations are stored as metadata only.
+//! Every other escape sequence and every control character is dropped. Hyperlink destinations
+//! must be absolute URIs without whitespace or control characters before they can reach an action.
 
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
@@ -16,6 +17,8 @@ pub struct Cell {
     pub width: u8,
     /// Index into `Screen::styles`.
     pub style: u32,
+    /// Index into `Screen::hyperlinks`. 0 means no hyperlink.
+    pub hyperlink: u32,
 }
 
 pub struct Screen {
@@ -24,15 +27,25 @@ pub struct Screen {
     pub wrapped: Vec<bool>,
     /// Distinct SGR states. Index 0 is the default style (empty string).
     pub styles: Vec<String>,
+    pub hyperlinks: Vec<String>,
+}
+
+/// A hyperlink's visible character range and its hidden destination.
+pub struct Hyperlink {
+    pub start: usize,
+    pub end: usize,
+    pub uri: String,
 }
 
 /// One logical line: the rows that belong together because the terminal wrapped them.
+#[derive(Default)]
 pub struct Line {
     pub text: String,
     /// Byte offset in `text` of each character.
     pub byte: Vec<usize>,
     /// (row, column) of each character.
     pub pos: Vec<(usize, usize)>,
+    pub hyperlinks: Vec<Hyperlink>,
 }
 
 impl Line {
@@ -56,6 +69,8 @@ struct Builder {
     index: HashMap<String, u32>,
     current: String,
     style: u32,
+    hyperlinks: Vec<String>,
+    hyperlink: u32,
 }
 
 impl Builder {
@@ -71,6 +86,8 @@ impl Builder {
             index,
             current: String::new(),
             style: 0,
+            hyperlinks: vec![String::new()],
+            hyperlink: 0,
         }
     }
 
@@ -98,6 +115,28 @@ impl Builder {
         };
     }
 
+    fn osc(&mut self, payload: &str) {
+        let Some(rest) = payload.strip_prefix("8;") else {
+            return;
+        };
+        self.hyperlink = 0;
+        let Some((_, uri)) = rest.split_once(';') else {
+            return;
+        };
+        let Some((scheme, _)) = uri.split_once(':') else {
+            return;
+        };
+        if payload.chars().any(char::is_control)
+            || uri.chars().any(char::is_whitespace)
+            || !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            || !scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+        {
+            return;
+        }
+        self.hyperlinks.push(uri.to_string());
+        self.hyperlink = (self.hyperlinks.len() - 1) as u32;
+    }
+
     /// `ESC [ n C` moves the cursor right. Rex uses it for a run of empty cells, so it becomes `n` blank
     /// cells. Dropping it would shift the rest of the row to the left. The cursor stops at the last column.
     fn forward(&mut self, params: &str) {
@@ -107,7 +146,7 @@ impl Builder {
         let n = params.parse::<usize>().unwrap_or(1).max(1);
         let room = if self.cols > 0 { self.cols.saturating_sub(self.row.len()) } else { 4096 };
         for _ in 0..n.min(room) {
-            self.row.push(Cell { ch: ' ', width: 1, style: 0 });
+            self.row.push(Cell { ch: ' ', width: 1, style: 0, hyperlink: 0 });
         }
     }
 
@@ -120,9 +159,9 @@ impl Builder {
             self.rows.push(std::mem::take(&mut self.row));
             self.wrapped.push(true);
         }
-        self.row.push(Cell { ch: c, width: w as u8, style: self.style });
+        self.row.push(Cell { ch: c, width: w as u8, style: self.style, hyperlink: self.hyperlink });
         if w == 2 {
-            self.row.push(Cell { ch: ' ', width: 0, style: self.style });
+            self.row.push(Cell { ch: ' ', width: 0, style: self.style, hyperlink: self.hyperlink });
         }
     }
 
@@ -135,7 +174,12 @@ impl Builder {
     fn finish(mut self) -> Screen {
         self.rows.push(std::mem::take(&mut self.row));
         self.wrapped.push(false);
-        Screen { rows: self.rows, wrapped: self.wrapped, styles: self.styles }
+        Screen {
+            rows: self.rows,
+            wrapped: self.wrapped,
+            styles: self.styles,
+            hyperlinks: self.hyperlinks,
+        }
     }
 }
 
@@ -168,12 +212,18 @@ impl Screen {
                     }
                     Some(']') => {
                         // OSC ends with BEL or ESC \.
-                        let mut prev_esc = false;
+                        let mut payload = String::new();
                         for n in it.by_ref() {
-                            if n == '\x07' || (prev_esc && n == '\\') {
+                            if n == '\x07' {
+                                b.osc(&payload);
                                 break;
                             }
-                            prev_esc = n == '\x1b';
+                            if n == '\\' && payload.ends_with('\x1b') {
+                                payload.pop();
+                                b.osc(&payload);
+                                break;
+                            }
+                            payload.push(n);
                         }
                     }
                     _ => {}
@@ -201,21 +251,26 @@ impl Screen {
 
     pub fn lines(&self) -> Vec<Line> {
         let mut out = Vec::new();
-        let mut cur = Line { text: String::new(), byte: Vec::new(), pos: Vec::new() };
+        let mut cur = Line::default();
         for (r, row) in self.rows.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if cell.width == 0 {
                     continue;
                 }
+                let index = cur.pos.len();
                 cur.byte.push(cur.text.len());
                 cur.text.push(cell.ch);
                 cur.pos.push((r, c));
+                if cell.hyperlink != 0 {
+                    let uri = &self.hyperlinks[cell.hyperlink as usize];
+                    match cur.hyperlinks.last_mut() {
+                        Some(link) if link.end == index && link.uri == *uri => link.end += 1,
+                        _ => cur.hyperlinks.push(Hyperlink { start: index, end: index + 1, uri: uri.clone() }),
+                    }
+                }
             }
             if !self.wrapped[r] {
-                out.push(std::mem::replace(
-                    &mut cur,
-                    Line { text: String::new(), byte: Vec::new(), pos: Vec::new() },
-                ));
+                out.push(std::mem::take(&mut cur));
             }
         }
         if !cur.pos.is_empty() {
@@ -329,5 +384,70 @@ mod tests {
     fn tab_expands_to_next_multiple_of_eight() {
         let s = Screen::parse("a\tb\n", 20);
         assert_eq!(row_text(&s, 0), "a       b");
+    }
+
+    #[test]
+    fn osc8_keeps_destinations_separate_from_visible_text_with_either_terminator() {
+        for end in ["\x07", "\x1b\\"] {
+            let vt = format!("see \x1b]8;id=docs;https://example.com/docs;a=1{end}docs\x1b]8;;{end} end");
+            let lines = Screen::parse(&vt, 80).lines();
+            assert_eq!(lines[0].text, "see docs end");
+            let link = &lines[0].hyperlinks[0];
+            assert_eq!((link.start, link.end, link.uri.as_str()), (4, 8, "https://example.com/docs;a=1"));
+        }
+    }
+
+    #[test]
+    fn osc8_survives_style_changes_and_unrelated_osc() {
+        let lines = Screen::parse(
+            "\x1b]8;;https://example.com\x07a\x1b[31mb\x1b[0m\x1b]0;title\x07c\x1b]8;;\x07d",
+            80,
+        ).lines();
+        assert_eq!(lines[0].text, "abcd");
+        assert_eq!(lines[0].hyperlinks.len(), 1);
+        assert_eq!((lines[0].hyperlinks[0].start, lines[0].hyperlinks[0].end), (0, 3));
+    }
+
+    #[test]
+    fn osc8_ranges_follow_wide_characters_wrapping_and_trimming() {
+        let screen = Screen::parse("\x1b]8;;file:///tmp/docs.md\x07日本語\x1b]8;;\x07!", 4).tail(1);
+        let lines = screen.lines();
+        assert_eq!(lines[0].text, "語!");
+        assert_eq!(lines[0].pos, vec![(0, 0), (0, 2)]);
+        let link = &lines[0].hyperlinks[0];
+        assert_eq!((link.start, link.end, link.uri.as_str()), (0, 1, "file:///tmp/docs.md"));
+    }
+
+    #[test]
+    fn osc8_closes_and_replaces_the_active_destination() {
+        let lines = Screen::parse(
+            "\x1b]8;;https://one\x07a\x1b]8;;\x07b\x1b]8;;https://two\x07c\x1b]8;;https://three\x07d\x1b]8;;\x07e",
+            80,
+        ).lines();
+        let links: Vec<_> = lines[0].hyperlinks.iter().map(|l| (l.start, l.end, l.uri.as_str())).collect();
+        assert_eq!(lines[0].text, "abcde");
+        assert_eq!(links, vec![(0, 1, "https://one"), (2, 3, "https://two"), (3, 4, "https://three")]);
+    }
+
+    #[test]
+    fn osc8_rejects_malformed_destinations_and_clears_the_previous_link() {
+        for payload in [
+            "8;missing-separator", "8;;", "8;;relative/path", "8;;--option", "8;;1bad:target",
+            "8;;https://bad url", "8;;https://bad\u{009b}url", "8;id=bad\n;https://example.com",
+        ] {
+            let vt = format!("\x1b]8;;https://valid\x07a\x1b]{payload}\x1b\\x");
+            let lines = Screen::parse(&vt, 80).lines();
+            assert_eq!(lines[0].text, "ax");
+            assert_eq!(lines[0].hyperlinks.len(), 1, "{payload:?}");
+            assert_eq!(lines[0].hyperlinks[0].end, 1, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_osc8_is_not_applied_or_shown() {
+        let screen = Screen::parse("visible\x1b]8;;https://hidden", 80);
+        assert_eq!(screen.lines()[0].text, "visible");
+        assert!(screen.lines()[0].hyperlinks.is_empty());
+        assert_eq!(screen.hyperlinks, vec![String::new()]);
     }
 }

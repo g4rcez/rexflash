@@ -64,13 +64,13 @@ pub fn labels(hits: &[Hit], lines: &[Line], alphabet: &[char]) -> Vec<Option<cha
     (0..hits.len()).map(|i| free.get(i).copied()).collect()
 }
 
-/// The text a pick copies: the pattern match that covers the hit, else the whole word around it.
-pub fn pick_text(lines: &[Line], found: &[Found], hit: &Hit) -> String {
+/// The value a pick copies and whether it is a URI: the match covering the hit, else the surrounding word.
+pub fn pick_text(lines: &[Line], found: &[Found], hit: &Hit) -> (String, bool) {
     if let Some(f) = found
         .iter()
         .find(|f| f.line == hit.line && f.start <= hit.start && hit.end <= f.end)
     {
-        return f.text.clone();
+        return (f.text.clone(), f.is_uri);
     }
     let chars: Vec<char> = lines[hit.line].text.chars().collect();
     let (mut s, mut e) = (hit.start, hit.end);
@@ -82,11 +82,12 @@ pub fn pick_text(lines: &[Line], found: &[Found], hit: &Hit) -> String {
     }
     let word: String = chars[s..e].iter().collect();
     let word = word.trim_matches(|c| "\"'`()[]{}<>,;".contains(c));
-    if word.is_empty() {
+    let text = if word.is_empty() {
         chars[hit.start..hit.end].iter().collect()
     } else {
         word.to_string()
-    }
+    };
+    (text, false)
 }
 
 #[cfg(test)]
@@ -141,13 +142,13 @@ mod tests {
         let l = lines("open https://example.com/x now\n");
         let found = patterns::find_all(&patterns::build(None, &[]).unwrap(), &l);
         let hit = search(&l, "exam").remove(0);
-        assert_eq!(pick_text(&l, &found, &hit), "https://example.com/x");
+        assert_eq!(pick_text(&l, &found, &hit), ("https://example.com/x".into(), false));
     }
 
     #[test]
     fn pick_outside_any_pattern_copies_the_word_without_quotes() {
         let l = lines("say (\"hello,\" world)\n");
         let hit = search(&l, "ell").remove(0);
-        assert_eq!(pick_text(&l, &[], &hit), "hello");
+        assert_eq!(pick_text(&l, &[], &hit), ("hello".into(), false));
     }
 }

@@ -29,6 +29,7 @@ pub enum Mode {
 
 pub struct Picked {
     pub text: String,
+    pub is_uri: bool,
     pub modifier: Modifier,
     pub hint: String,
 }
@@ -68,7 +69,9 @@ impl Loaded {
     /// `cols` and `pane_rows` are the size of the captured pane. Up to `scrollback` rows above its screen are kept.
     pub fn new(vt: &str, cols: usize, pane_rows: usize, scrollback: usize, patterns: &[Pattern]) -> Loaded {
         let keep = pane_rows + scrollback;
-        let screen = Screen::parse(tail_lines(vt, keep + 1), cols).tail(keep);
+        // OSC 8 state can start before the retained rows; ordinary captures can be trimmed first.
+        let vt = if vt.contains("\x1b]8;") { vt } else { tail_lines(vt, keep + 1) };
+        let screen = Screen::parse(vt, cols).tail(keep);
         let live_top = screen.rows.len().saturating_sub(pane_rows);
         let lines = screen.lines();
         let found = patterns::find_all(patterns, &lines);
@@ -219,7 +222,8 @@ impl Overlay for Hint<'_> {
                 let mut next = self.typed.clone();
                 next.push(c);
                 if let Some(g) = self.labels.iter().position(|l| *l == next) {
-                    return Step::Pick(Picked { text: self.texts[g].to_string(), modifier, hint: next });
+                    let is_uri = self.loaded.found.iter().any(|f| f.is_uri && f.text == self.texts[g]);
+                    return Step::Pick(Picked { text: self.texts[g].to_string(), is_uri, modifier, hint: next });
                 }
                 // A prefix that matches no label starts over.
                 self.typed = if self.labels.iter().any(|l| l.starts_with(&next)) { next } else { String::new() };
@@ -282,8 +286,8 @@ impl Overlay for Flash<'_> {
         let (hits, labels) = self.hits();
         let pick = |i: usize, modifier: Modifier| {
             let hint = labels[i].map(String::from).unwrap_or_default();
-            let text = flash::pick_text(&self.loaded.lines, &self.loaded.found, &hits[i]);
-            Step::Pick(Picked { text, modifier, hint })
+            let (text, is_uri) = flash::pick_text(&self.loaded.lines, &self.loaded.found, &hits[i]);
+            Step::Pick(Picked { text, is_uri, modifier, hint })
         };
         match key {
             Key::Cancel => Step::Cancel,
@@ -331,7 +335,7 @@ fn io_err(e: io::Error) -> String {
 
 /// Runs the action of a pick: copy first, then paste, open or the configured command.
 pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>) -> Result<(), String> {
-    actions::perform(cfg.action(picked.modifier), &picked.text, picked.modifier, &picked.hint, target, cwd)
+    actions::perform(cfg.action(picked.modifier), &picked.text, picked.is_uri, picked.modifier, &picked.hint, target, cwd)
 }
 
 /// The float overlay: this process owns a terminal that covers the pane.
@@ -554,5 +558,57 @@ mod tests {
     #[test]
     fn scrolling_a_short_capture_stays_at_the_top() {
         assert_eq!(scrolled(0, 3, 10, Scroll::PageDown), 0);
+    }
+
+    #[test]
+    fn hint_picks_the_osc8_destination_with_each_modifier() {
+        let l = loaded("see \x1b]8;;https://example.com/hidden\x07仕様書\x1b]8;;\x07\n\n\n");
+        for (key, modifier) in [('a', Modifier::Main), ('A', Modifier::Shift), ('a', Modifier::Ctrl), ('a', Modifier::Alt)] {
+            let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+            let Step::Pick(p) = o.step(Key::Char(key, modifier)) else { panic!("expected a pick") };
+            assert_eq!(p.text, "https://example.com/hidden");
+            assert_eq!(p.modifier, modifier);
+            assert!(p.is_uri);
+        }
+    }
+
+    #[test]
+    fn hint_distinguishes_identical_link_text_with_different_destinations() {
+        let l = loaded("\x1b]8;;https://one\x07docs\x1b]8;;\x07 \x1b]8;;https://two\x07docs\x1b]8;;\x07\n\n\n");
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))).0, "https://one");
+        assert_eq!(pick(o.step(Key::Char('s', Modifier::Main))).0, "https://two");
+    }
+
+    #[test]
+    fn hint_reuses_the_same_label_for_repeated_destinations() {
+        let l = loaded("\x1b]8;;https://same\x07one\x1b]8;;\x07 \x1b]8;;https://same\x07two\x1b]8;;\x07\n\n\n");
+        let o = overlay(Mode::Hint, &l, &cfg("{}"));
+        assert_eq!(o.marks().labels.len(), 2);
+        assert!(o.marks().labels.values().all(|&c| c == 'a'));
+    }
+
+    #[test]
+    fn flash_searches_visible_osc8_text_and_picks_its_destination() {
+        let l = loaded("see \x1b]8;;https://example.com/hidden\x07仕様書\x1b]8;;\x07\n\n\n");
+        assert!(flash::search(&l.lines, "hidden").is_empty());
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        for c in "仕様".chars() {
+            assert!(matches!(o.step(Key::Char(c, Modifier::Main)), Step::Continue));
+        }
+        let Step::Pick(p) = o.step(Key::Enter) else { panic!("expected a pick") };
+        assert_eq!(p.text, "https://example.com/hidden");
+        assert!(p.is_uri);
+    }
+
+    #[test]
+    fn osc8_state_survives_discarded_history() {
+        let vt = "\x1b]8;;https://example.com/history\x07zero\none\ntwo\nthree\nfour\nfive\x1b]8;;\x07\n";
+        let l = Loaded::new(vt, 80, 2, 1, &patterns::build(None, &[]).unwrap());
+        assert_eq!((l.screen.rows.len(), l.live_top, l.found.len()), (3, 1, 3));
+        assert!(l.found.iter().all(|f| f.is_uri && f.text == "https://example.com/history"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        o.set_view(l.live_top, 2);
+        assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))).0, "https://example.com/history");
     }
 }

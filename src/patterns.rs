@@ -23,6 +23,8 @@ pub struct Found {
     /// Character index after the last character.
     pub end: usize,
     pub text: String,
+    /// OSC 8 destinations are used verbatim, including when opening them.
+    pub is_uri: bool,
     pub weight: u8,
 }
 
@@ -167,7 +169,8 @@ pub fn build(names: Option<&[String]>, extra: &[String]) -> Result<Vec<Pattern>,
     Ok(out)
 }
 
-/// Finds matches in every line. Inside one line, overlaps resolve to the leftmost match, then the longest.
+/// Finds hyperlinks and pattern matches. Hyperlinks take precedence over overlapping patterns;
+/// other overlaps resolve to the leftmost match, then the longest.
 pub fn find_all(patterns: &[Pattern], lines: &[Line]) -> Vec<Found> {
     let mut out = Vec::new();
     for (li, line) in lines.iter().enumerate() {
@@ -184,15 +187,29 @@ pub fn find_all(patterns: &[Pattern], lines: &[Line]) -> Vec<Found> {
                 if text.is_empty() || p.check.is_some_and(|check| !check(text)) {
                     continue;
                 }
+                let start = line.char_index(m.start());
+                let end = line.char_index(m.start() + text.len());
+                if line.hyperlinks.iter().any(|link| start < link.end && link.start < end) {
+                    continue;
+                }
                 found.push(Found {
                     line: li,
-                    start: line.char_index(m.start()),
-                    end: line.char_index(m.start() + text.len()),
+                    start,
+                    end,
                     text: text.to_string(),
+                    is_uri: false,
                     weight: p.weight,
                 });
             }
         }
+        found.extend(line.hyperlinks.iter().map(|link| Found {
+            line: li,
+            start: link.start,
+            end: link.end,
+            text: link.uri.clone(),
+            is_uri: true,
+            weight: 5,
+        }));
         found.sort_by(|a, b| a.start.cmp(&b.start).then((b.end - b.start).cmp(&(a.end - a.start))));
         let mut last = 0;
         for f in found {
@@ -351,5 +368,35 @@ mod tests {
         let lines = screen.lines();
         let patterns = build(Some(&[]), &["ticket (?P<match>[A-Z]+-\\d+)".to_string()]).unwrap();
         assert_eq!(find_all(&patterns, &lines)[0].text, "ABC-123");
+    }
+
+    #[test]
+    fn osc8_is_found_even_without_regex_patterns() {
+        assert_eq!(
+            matches("\x1b]8;;https://example.com/docs?a=1;b=2#section?\x07仕様書\x1b]8;;\x07", Some(&[])),
+            vec!["https://example.com/docs?a=1;b=2#section?"]
+        );
+    }
+
+    #[test]
+    fn osc8_wins_over_patterns_that_start_before_or_inside_its_label() {
+        assert_eq!(
+            matches("https://shown.example/\x1b]8;;https://target.example/docs\x07path\x1b]8;;\x07 /unlinked/path", None),
+            vec!["https://target.example/docs", "/unlinked/path"]
+        );
+        assert_eq!(
+            matches("\x1b]8;;file:///actual/source.rs#L7\x07src/main.rs:42:5\x1b]8;;\x07", None),
+            vec!["file:///actual/source.rs#L7"]
+        );
+    }
+
+    #[test]
+    fn osc8_wins_over_a_larger_custom_pattern() {
+        let lines = Screen::parse("before \x1b]8;;https://target\x07docs\x1b]8;;\x07 after", 80).lines();
+        let patterns = build(Some(&[]), &["before .* after".into()]).unwrap();
+        let found = find_all(&patterns, &lines);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].start, found[0].end, found[0].text.as_str()), (7, 11, "https://target"));
+        assert!(found[0].is_uri);
     }
 }
