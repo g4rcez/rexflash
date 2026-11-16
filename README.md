@@ -11,7 +11,8 @@ It is a port of the ideas in [tmux-fingers](https://github.com/Morantron/tmux-fi
 [flash.nvim](https://github.com/folke/flash.nvim) (search labels) to Rex.
 
 - **Hint mode** labels what looks like something you want to grab: URLs, `file:line` references,
-  paths, hashes, IPs, UUIDs, emails, versions and more.
+  paths, hashes, IPs, UUIDs, emails, versions and more. It also labels OSC 8 hyperlinks, even when
+  the destination URL is hidden behind text such as “documentation”.
 - **Flash mode** labels whatever you type. Type `loc`, then press the label next to the match.
 - **Three ways to pick.** Lowercase label: copy. Uppercase (Shift): paste into the pane. Ctrl: open.
   All three are configurable, and a pick is always copied first.
@@ -103,6 +104,15 @@ live screen.
 
 `:open:` runs macOS `open` on the match. For `src/main.rs:42:5` it opens `src/main.rs`. `~/` is
 expanded, and relative paths resolve against the working directory of the pane.
+
+**OSC 8 hyperlinks**
+
+Hint mode labels the visible link text; picking it copies, pastes or opens its destination URI.
+Flash mode searches the visible text and uses the destination when the selected match is inside
+one hyperlink. Hyperlinks are recognized independently of the `patterns` option and take precedence
+over overlapping regex matches. They work across wrapped rows, and repeated destinations share a
+hint label. Destinations must be absolute URIs without whitespace or control characters; other OSC
+sequences are ignored. Opening a hyperlink passes its URI unchanged to macOS `open`.
 
 ## Patterns
 
